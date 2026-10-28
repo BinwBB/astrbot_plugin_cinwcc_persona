@@ -1,6 +1,6 @@
 name: CinwCC_人格管理
 description: 角色状态管理 - 维护好感度/淫乱度/情绪等跨轮持久化数值。支持对话历史解析、人设模板填充。注入到 req.prompt 头部，不修改 system_prompt。
 author: mcxxiu
-version: 1.5.2
+version: 1.6.0
 display_name: CinwCC_人格管理
 repo: 

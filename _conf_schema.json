@@ -127,6 +127,71 @@
     "min": 0,
     "max": 1
   },
+  "enable_time_decay": {
+    "description": "═══ 离线推演 ═══",
+    "type": "bool",
+    "hint": "开启后，长时间没对话会按离线时长做一次静默推演：心情向基线（平静=60）回归、社交需求上升。纯内存计算，不增加首字延迟。",
+    "default": true
+  },
+  "decay_rate": {
+    "description": "推演强度",
+    "type": "float",
+    "hint": "心情每小时收掉偏离基线差距的多少比例（0.15=每小时15%）；社交需求每小时上升 decay_rate×40 点。0=完全不推演。",
+    "default": 0.15,
+    "min": 0,
+    "max": 1
+  },
+  "max_offline_hours": {
+    "description": "离线上限（小时）",
+    "type": "float",
+    "hint": "离线时长超过这个值就按这个值算，避免久别之后数值直接冲到边界。",
+    "default": 12,
+    "min": 0.5,
+    "max": 168
+  },
+  "storage_backend": {
+    "description": "═══ 存储 ═══",
+    "type": "string",
+    "hint": "sqlite=快照表+事件流水（默认，支持 /persona_state 查事件）；json=老的 state.json。切换后重载插件生效，两种格式互相兼容。",
+    "options": ["sqlite", "json"],
+    "default": "sqlite"
+  },
+  "db_path": {
+    "description": "数据库路径",
+    "type": "string",
+    "hint": "留空则使用 data/plugin_data/lili_state.db。一般不用改。",
+    "default": ""
+  },
+  "enable_relationship_tool": {
+    "description": "═══ 按需工具 ═══",
+    "type": "bool",
+    "hint": "允许模型在需要时调用 get_relationship_detail 查关系细节（好感档位、重复消息、上条间隔）。日常对话不会触发。",
+    "default": true
+  },
+  "enable_memory_tool": {
+    "description": "允许回忆工具",
+    "type": "bool",
+    "hint": "允许模型在需要时调用 get_memory_summary 回忆本会话最近的对话原文。日常对话不会触发。",
+    "default": true
+  },
+  "auto_delegate_memory": {
+    "description": "═══ 能力边界 ═══",
+    "type": "bool",
+    "hint": "检测到记忆类插件时，自动把记忆能力委托出去（本插件记忆工具降级为提示语），避免两个插件都往 prompt 里塞记忆。",
+    "default": true
+  },
+  "delegate_target": {
+    "description": "指定委托对象",
+    "type": "string",
+    "hint": "填插件目录名可强制委托，优先于自动检测；留空=自动判断。",
+    "default": ""
+  },
+  "inject_wrapper": {
+    "description": "注入标记",
+    "type": "bool",
+    "hint": "用 〖persona_state〗…〖/persona_state〗 包裹每轮注入的状态文本，方便下游解析。关闭后注入内容不变，只是不带标记。",
+    "default": true
+  },
   "friend_list": {
     "description": "═══ ⑤ 人际关系 ═══",
     "type": "text",

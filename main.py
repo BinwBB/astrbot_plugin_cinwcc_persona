@@ -9,8 +9,10 @@
   - 启动时验证 SKILL.md 文件存在性，输出同步状态日志
 """
 
+import asyncio
 import json
 import os
+import sqlite3
 import random
 import re
 import time
@@ -45,13 +47,182 @@ def _default_state(config: dict = None) -> dict:
         "lewdness": cfg.get("initial_lewdness", 20),
         "depravity": cfg.get("initial_depravity", 0),
         "emotion": 60,
+        "social_need": 20,
+        "last_interaction_time": 0.0,
         "stutter_done": False,
         "conversation_log": [],
         "_last_date": "",
     }
 
 
+# ── 内存状态缓存 ──
+# 设计要点（延迟红线）：
+#   1. 请求路径只读 _STATE_CACHE，不做任何文件 IO
+#   2. 启动时 prewarm_states() 一次性把磁盘状态读进内存
+#   3. 写盘走后台协程 + 防抖合并，实际落盘丢到线程里，不占事件循环
+_STATE_CACHE: dict = {}      # 状态文件名 stem -> 状态 dict
+_DIRTY: set = set()          # 待落盘的 key
+_SKIP_LOG: set = set()       # 落盘时不写 conversation_log 的 key
+_FLUSH_WORKER = None         # 后台落盘协程
+_FLUSH_EVENT = None          # 通知后台协程有新改动
+FLUSH_DELAY_SECS = 1.5       # 防抖窗口：这段时间内的多次改动合并成一次写盘
+STATE_SCHEMA_VERSION = 2     # 状态结构版本，升级字段时 +1，靠它触发就地补齐
+
+
+def _cache_key(umo: str) -> str:
+    return umo.replace(":", "_").replace("/", "_").replace("\\", "_")
+
+
+def _path_by_key(key: str) -> Path:
+    return STATE_DIR / f"{key}.json"
+
+
+def _normalize_state(state: dict, config: dict = None) -> dict:
+    """纯内存补齐字段 + 数值校验，不写盘。"""
+    defaults = _default_state(config)
+    for k, v in defaults.items():
+        state.setdefault(k, v)
+    state.setdefault("last_seen", {})
+    for k in ("affection", "lewdness", "depravity", "emotion", "social_need"):
+        v = state.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            state[k] = defaults[k]
+    v = state.get("last_interaction_time", 0.0)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        state["last_interaction_time"] = 0.0
+    if not isinstance(state.get("conversation_log"), list):
+        state["conversation_log"] = []
+    if not isinstance(state.get("last_seen"), dict):
+        state["last_seen"] = {}
+    state["_schema_version"] = STATE_SCHEMA_VERSION
+    return state
+
+
+def prewarm_states(config: dict = None) -> int:
+    """启动时预热：把持久化状态读进内存。只在初始化调用。
+
+    sqlite 后端读快照表；json 后端读 .json，读不到再看 .json.bak
+    （迁移后原文件会改名成 .bak，切回 json 后端时靠它兜底）。
+    """
+    _ensure_dir()
+    loaded = 0
+
+    if _BACKEND == "sqlite":
+        for key, st in _load_snapshots_db().items():
+            if key in _STATE_CACHE:
+                continue
+            _STATE_CACHE[key] = _normalize_state(st, config)
+            loaded += 1
+        for key, st in _STATE_CACHE.items():
+            _LAST_PERSISTED[key] = {d: int(st.get(d, 0) or 0) for d in EVENT_DIMS}
+        return loaded
+
+    for pattern in ("*.json", "*.json.bak*"):
+        try:
+            files = sorted(STATE_DIR.glob(pattern))
+        except Exception as e:
+            logger.warning(f"扫描状态目录失败({pattern}): {e}")
+            continue
+        for path in files:
+            key = _key_from_name(path.name)
+            if key in _STATE_CACHE:
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if not isinstance(st, dict):
+                    st = {}
+            except Exception as e:
+                logger.warning(f"读取状态文件失败 {path.name}: {e}")
+                continue
+            _STATE_CACHE[key] = _normalize_state(st, config)
+            loaded += 1
+    for key, st in _STATE_CACHE.items():
+        _LAST_PERSISTED[key] = {d: int(st.get(d, 0) or 0) for d in EVENT_DIMS}
+    return loaded
+
+
+def get_state(umo: str, config: dict = None) -> dict:
+    """请求路径专用：只查内存。没命中就当作新会话，绝不读盘。
+
+    命中后仍检查结构版本：版本不符就地补齐字段（纯内存），
+    这样热重载/结构升级时不会出现"缓存里是旧结构、新字段永远补不上"。
+    """
+    key = _cache_key(umo)
+    st = _STATE_CACHE.get(key)
+    if st is not None and st.get("_schema_version") == STATE_SCHEMA_VERSION:
+        return st
+    if st is None:
+        st = _default_state(config)
+        st["_schema_version"] = STATE_SCHEMA_VERSION
+        _STATE_CACHE[key] = st
+    else:
+        _normalize_state(st, config)   # 旧结构就地补齐，几微秒
+    mark_dirty(key)
+    return st
+
+
+def _snapshot(state: dict, key: str) -> dict:
+    """浅拷贝快照，供写盘线程使用（避免写盘期间状态被改）。"""
+    snap = {}
+    for k, v in state.items():
+        if k == "conversation_log" and key in _SKIP_LOG:
+            continue
+        if isinstance(v, dict):
+            snap[k] = dict(v)
+        elif isinstance(v, list):
+            snap[k] = [dict(i) if isinstance(i, dict) else i for i in v]
+        else:
+            snap[k] = v
+    return snap
+
+
+def _ensure_flush_worker():
+    global _FLUSH_WORKER, _FLUSH_EVENT
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if (_FLUSH_WORKER is not None and not _FLUSH_WORKER.done()
+            and _FLUSH_WORKER.get_loop() is loop):
+        return
+    _FLUSH_EVENT = asyncio.Event()
+    _FLUSH_WORKER = loop.create_task(_flush_worker())
+    logger.debug("状态落盘后台协程已启动")
+
+
+async def _flush_worker():
+    ev = _FLUSH_EVENT
+    while True:
+        await ev.wait()
+        await asyncio.sleep(FLUSH_DELAY_SECS)
+        ev.clear()
+        keys = list(_DIRTY)
+        _DIRTY.clear()
+        try:
+            await asyncio.to_thread(_persist, keys)
+        except Exception as e:
+            logger.warning(f"状态落盘失败: {e}")
+
+
+def mark_dirty(key: str, source: str = "chat"):
+    """标记某状态待落盘，交给后台协程。请求路径上只是一次 set.add。"""
+    _DIRTY.add(key)
+    _DIRTY_SOURCE[key] = source
+    _ensure_flush_worker()
+    if _FLUSH_EVENT is not None:
+        _FLUSH_EVENT.set()
+
+
+def flush_all_sync():
+    """进程退出/插件卸载前同步刷盘。非请求路径。"""
+    keys = list(_DIRTY)
+    _DIRTY.clear()
+    _persist(keys)
+
+
 def load_state(umo: str, config: dict = None) -> dict:
+    """直接读盘（保留给非请求路径使用；请求路径请用 get_state）。"""
     _ensure_dir()
     path = _state_path(umo)
     if not path.exists():
@@ -87,13 +258,275 @@ def load_state(umo: str, config: dict = None) -> dict:
 
 
 def save_state(umo: str, state: dict):
-    _ensure_dir()
-    _write(_state_path(umo), state)
+    """请求路径上只更新内存并打脏标记，不写盘。
+
+    兼容旧调用：如果传进来的 dict 被裁剪掉了 conversation_log，
+    这里把缓存里的日志补回去（日志留在内存），只在写盘时排除。
+    """
+    key = _cache_key(umo)
+    if "conversation_log" not in state:
+        cached = _STATE_CACHE.get(key)
+        if cached is not None and "conversation_log" in cached:
+            merged = dict(state)
+            merged["conversation_log"] = cached["conversation_log"]
+            state = merged
+        _SKIP_LOG.add(key)
+    else:
+        _SKIP_LOG.discard(key)
+    _STATE_CACHE[key] = state
+    mark_dirty(key)
 
 
 def _write(path: Path, state: dict):
-    with open(path, "w", encoding="utf-8") as f:
+    """原子写：先写 .tmp 再替换，避免被强杀时留下半个文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ── 存储后端：SQLite（标准库，无第三方依赖）──
+# 两张业务表 + 一张元信息表：
+#   persona_state_snapshot  每个会话一行快照
+#   state_events            数值变化的事件流水
+#   state_meta              结构版本 / 迁移标记
+_BACKEND = "json"            # 当前后端：sqlite / json
+_DB_FILE: Path = None        # 当前数据库路径
+_PERSONA_ID = "default"      # 人格标识，先固定，为以后一人格一份状态留位
+_LAST_PERSISTED: dict = {}   # key -> {维度: 上次落盘数值}，供算事件增量
+_DIRTY_SOURCE: dict = {}     # key -> 最近一次改动来源（chat / decay / ...）
+EVENT_DIMS = ("affection", "lewdness", "depravity", "emotion", "social_need")
+META_VERSION = "1"
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS state_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS persona_state_snapshot (
+  umo        TEXT NOT NULL,
+  persona_id TEXT NOT NULL DEFAULT 'default',
+  state_json TEXT NOT NULL,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (umo, persona_id)
+);
+CREATE TABLE IF NOT EXISTS state_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  umo        TEXT NOT NULL,
+  persona_id TEXT NOT NULL DEFAULT 'default',
+  ts         REAL NOT NULL,
+  source     TEXT NOT NULL,
+  dimension  TEXT NOT NULL,
+  delta      REAL,
+  detail     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_umo_ts
+  ON state_events(umo, persona_id, ts DESC);
+"""
+
+
+def _db_path(config: dict = None) -> Path:
+    raw = ""
+    if config:
+        raw = str(config.get("db_path", "") or "").strip()
+    return Path(raw) if raw else Path("data/plugin_data/lili_state.db")
+
+
+def _db_connect(path: Path) -> sqlite3.Connection:
+    """每次在线程里新开连接（sqlite 连接不能跨线程复用）。WAL 让读不挡写。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=3.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=3000")
+    return conn
+
+
+def init_db(config: dict = None) -> None:
+    global _DB_FILE
+    _DB_FILE = _db_path(config)
+    conn = _db_connect(_DB_FILE)
+    try:
+        conn.executescript(_DDL)
+        conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES('schema_version', ?)",
+                     (META_VERSION,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_snapshots_db() -> dict:
+    out = {}
+    if _DB_FILE is None or not _DB_FILE.exists():
+        return out
+    conn = _db_connect(_DB_FILE)
+    try:
+        for umo, raw in conn.execute("SELECT umo, state_json FROM persona_state_snapshot"):
+            try:
+                st = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(st, dict):
+                out[umo] = st
+    finally:
+        conn.close()
+    return out
+
+
+def _backup_state_dir() -> Path:
+    """迁移前把整个状态目录复制一份（不动原文件）。"""
+    import shutil
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dst = STATE_DIR.parent / f"{STATE_DIR.name}_backup_{stamp}"
+    try:
+        shutil.copytree(STATE_DIR, dst)
+        logger.info(f"旧状态目录已备份: {dst}")
+    except Exception as e:
+        logger.warning(f"备份旧状态目录失败（继续迁移）: {e}")
+    return dst
+
+
+def migrate_json_to_db(config: dict = None) -> int:
+    """把旧 state.json 一次性导入 SQLite。
+
+    幂等设计：
+      1. 已有 migration_json_done 标记 → 整段跳过
+      2. 快照用 INSERT OR IGNORE → 重跑不会覆盖运行期数据
+      3. .bak 文件名冲突时自动加序号 → 重跑不会互相覆盖
+      4. 任何异常都不写 done 标记 → 下次启动自动重试
+    """
+    if _DB_FILE is None:
+        return 0
+    conn = _db_connect(_DB_FILE)
+    try:
+        if conn.execute("SELECT 1 FROM state_meta WHERE key='migration_json_done'").fetchone():
+            return 0
+        files = sorted(STATE_DIR.glob("*.json"))
+        if not files:
+            conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES('migration_json_done', ?)",
+                         (time.strftime("%Y-%m-%dT%H:%M:%S"),))
+            conn.commit()
+            return 0
+
+        backup_dir = _backup_state_dir()
+        now = time.time()
+        migrated = 0
+        for path in files:
+            key = path.stem
+            try:
+                st = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"迁移跳过 {path.name}: {e}")
+                continue
+            if not isinstance(st, dict):
+                continue
+            _normalize_state(st, config)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO persona_state_snapshot"
+                "(umo, persona_id, state_json, updated_at) VALUES(?, ?, ?, ?)",
+                (key, _PERSONA_ID, json.dumps(st, ensure_ascii=False), now))
+            if cur.rowcount:
+                migrated += 1
+            conn.execute(
+                "INSERT INTO state_events"
+                "(umo, persona_id, ts, source, dimension, delta, detail) VALUES(?,?,?,?,?,?,?)",
+                (key, _PERSONA_ID, now, "migrate", "state", 0, "import from state.json"))
+        conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES('migration_json_done', ?)",
+                     (time.strftime("%Y-%m-%dT%H:%M:%S"),))
+        conn.commit()
+
+        # 提交后再改名备份，原文件不删除
+        for path in files:
+            target = path.with_name(path.name + ".bak")
+            i = 1
+            while target.exists():
+                target = path.with_name(f"{path.name}.bak.{i}")
+                i += 1
+            try:
+                path.rename(target)
+            except Exception as e:
+                logger.warning(f"备份改名失败 {path.name}: {e}")
+        logger.info(f"JSON → SQLite 迁移完成: {migrated} 个会话（备份目录 {backup_dir.name}）")
+        return migrated
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning(f"JSON 迁移失败，下次启动重试: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _persist_db(keys: list) -> None:
+    """线程内执行：一次事务写快照 + 事件增量。"""
+    if _DB_FILE is None or not keys:
+        return
+    conn = _db_connect(_DB_FILE)
+    try:
+        now = time.time()
+        rows = []
+        events = []
+        new_vals = {}
+        for key in keys:
+            st = _STATE_CACHE.get(key)
+            if st is None:
+                continue
+            snap = _snapshot(st, key)
+            rows.append((key, _PERSONA_ID, json.dumps(snap, ensure_ascii=False), now))
+            prev = _LAST_PERSISTED.get(key) or {}
+            src = _DIRTY_SOURCE.get(key, "chat")
+            vals = {}
+            for dim in EVENT_DIMS:
+                try:
+                    v = int(snap.get(dim, 0) or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                vals[dim] = v
+                if dim in prev and v != prev[dim]:
+                    events.append((key, _PERSONA_ID, now, src, dim, v - prev[dim], None))
+            new_vals[key] = vals
+        conn.executemany(
+            "INSERT INTO persona_state_snapshot(umo, persona_id, state_json, updated_at)"
+            " VALUES(?,?,?,?) ON CONFLICT(umo, persona_id)"
+            " DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+            rows)
+        if events:
+            conn.executemany(
+                "INSERT INTO state_events"
+                "(umo, persona_id, ts, source, dimension, delta, detail) VALUES(?,?,?,?,?,?,?)",
+                events)
+        conn.commit()
+        _LAST_PERSISTED.update(new_vals)
+        if events:
+            logger.debug(f"[persist] 落盘 {len(rows)} 个会话，新增 {len(events)} 条事件")
+    finally:
+        conn.close()
+
+
+def _persist(keys: list) -> None:
+    """按当前后端落盘。线程内调用，不占事件循环。"""
+    if not keys:
+        return
+    if _BACKEND == "sqlite":
+        _persist_db(keys)
+        return
+    for key in keys:
+        st = _STATE_CACHE.get(key)
+        if st is None:
+            continue
+        _write(_path_by_key(key), _snapshot(st, key))
+
+
+def _key_from_name(name: str) -> str:
+    """从状态文件名还原缓存 key（兼容 .json 和 .json.bak / .json.bak.N）。"""
+    if ".json.bak" in name:
+        return name.split(".json.bak")[0]
+    if name.endswith(".json"):
+        return name[:-5]
+    return name
 
 
 # ── 工具函数 ──
@@ -554,10 +987,105 @@ def _load_skill_content() -> dict:
 
 
 
+# ── 离线推演（纯内存、零 IO、O(1)）──
+MIN_DECAY_GAP_SECS = 1800      # 间隔小于 30 分钟直接跳过：连续聊天时零影响
+EMOTION_BASELINE = 60          # 心情基线＝平静
+SOCIAL_GAIN_FACTOR = 40        # 社交需求每小时增量 = decay_rate × 40
+HINT_EMOTION_DELTA = 12        # 心情位移 ≥12 分才算"显著"
+HINT_SOCIAL_DELTA = 25         # 社交需求涨幅 ≥25 点才算"显著"
+
+
+def apply_time_decay(state: dict, now: float = None,
+                     config: dict = None) -> tuple:
+    """根据离线时长做一次静默推演，返回 (state, hint)。
+
+    hint 是"仅本轮"的提示句，空字符串表示不提示（不写进 state，避免被持久化）。
+    全程纯内存：一次减法 + 一次阈值比较；只有命中推演才做两次幂运算。
+    """
+    if now is None:
+        now = time.time()
+
+    # 关注：last_interaction_time 的更新不在这里做，由调用方统一更新
+    last = state.get("last_interaction_time", 0.0) or 0.0
+    try:
+        last = float(last)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last <= 0:
+        # 老状态没有基线：退回用 last_seen 里最近的一次交互时间做基线
+        ls = state.get("last_seen") or {}
+        if isinstance(ls, dict) and ls:
+            try:
+                last = max(float(v) for v in ls.values()
+                           if isinstance(v, (int, float)) and not isinstance(v, bool))
+            except (TypeError, ValueError):
+                last = 0.0
+    if last <= 0:
+        # 连 last_seen 都没有：本轮只记录时间，不推演，避免首次对话被当成离线了几十年
+        return state, ""
+
+    gap = now - last
+    if gap < MIN_DECAY_GAP_SECS:
+        # 快速连聊走这里：一个字段都不改，注入文本逐字节不变
+        return state, ""
+
+    if config is not None and not config.get("enable_time_decay", True):
+        return state, ""
+
+    rate = 0.15
+    max_hours = 12.0
+    if config is not None:
+        try:
+            rate = float(config.get("decay_rate", 0.15))
+        except (TypeError, ValueError):
+            rate = 0.15
+        try:
+            max_hours = float(config.get("max_offline_hours", 12))
+        except (TypeError, ValueError):
+            max_hours = 12.0
+    rate = min(max(rate, 0.0), 1.0)
+    if max_hours <= 0:
+        max_hours = 12.0
+    if rate == 0.0:
+        return state, ""
+
+    hours = min(gap / 3600.0, max_hours)   # 封顶，防止久别之后数值爆炸
+
+    em_old = state.get("emotion", EMOTION_BASELINE)
+    sn_old = state.get("social_need", 20)
+    if not isinstance(em_old, (int, float)):
+        em_old = EMOTION_BASELINE
+    if not isinstance(sn_old, (int, float)):
+        sn_old = 20
+
+    # 维度一：心情向基线回归。指数衰减是闭式解，离线 8 小时和 800 小时的计算量一样
+    em_new = EMOTION_BASELINE + (em_old - EMOTION_BASELINE) * ((1.0 - rate) ** hours)
+    # 维度二：社交需求随离线时长上升
+    sn_new = sn_old + rate * SOCIAL_GAIN_FACTOR * hours
+
+    em_new = int(round(min(max(em_new, 0), 100)))
+    sn_new = int(round(min(max(sn_new, 0), 100)))
+
+    d_em = em_new - int(em_old)
+    d_sn = sn_new - int(sn_old)
+    state["emotion"] = em_new
+    state["social_need"] = sn_new
+
+    hint = ""
+    if d_sn >= HINT_SOCIAL_DELTA:
+        hint = "（好久没人说话，有点想找人聊）"
+    elif abs(d_em) >= HINT_EMOTION_DELTA:
+        hint = "（心情慢慢平下来了）"
+    logger.debug(f"[decay] 离线 {hours:.2f}h，心情 {int(em_old)}→{em_new}，"
+                 f"社交 {int(sn_old)}→{sn_new}")
+    return state, hint
+
+
 def build_inject_text(state: dict, user_id: str, user_msg: str,
                        config: dict = None,
                        context_entries: int = 20, msg_max_chars: int = 200,
-                       thought_mode: str = "内心想法") -> str:
+                       thought_mode: str = "内心想法",
+                       decay_hint: str = "") -> str:
     bot_name = _get_bot_name(config)
     dup_count = todays_duplicate_count(state, user_msg, user_id)
     minutes = minutes_since_last(state, user_id)
@@ -598,28 +1126,28 @@ def build_inject_text(state: dict, user_id: str, user_msg: str,
             restriction = "\n【内容限制】\n禁止回复任何色情内容。\n"
     # 预先组装条件文本（避免 f-string 表达式内出现 \n）
     stutter_line = "说话有点结巴。\n\n" if stutter else "\n"
-    aff_line = f"你对ta{aff_feel}。\n" if enable_aff else "\n"
-    dup_line = f"TA刚发了条跟之前一模一样的消息，今天已经第{dup_count}次了。\n" if dup_count > 1 else ""
-    if minutes is None:
-        time_line = ""
-    elif minutes == "刚刚":
-        time_line = "TA刚发完上一条。\n"
-    else:
-        time_line = f"上条消息就在{minutes}发的。\n"
+    # 社交需求：只在高位时用文字体现，不报数字
+    social_line = "想找人说话。" if state.get("social_need", 0) >= 70 else ""
+    hint_line = f"{decay_hint}\n" if decay_hint else ""
+    obj_line = f"【对象】{user_id}，你对ta{aff_feel}。\n" if enable_aff else f"【对象】{user_id}。\n"
     ctx_line = f"{context}" if inject_ctx else ""
-    return (
-        f"【{bot_name}当前感受】\n"
-        f"现在是{period_label()}了。心情{em_label}{dep_suffix}。{lewd_feel}。\n"
+    # 说明：dup_count 仍要每轮统计（有累加副作用），但不再写进注入文本，
+    # 改由 get_relationship_detail 工具按需拉取；上条间隔同理。
+    _ = dup_count
+    body = (
+        f"【状态】现在是{period_label()}，心情{em_label}{dep_suffix}。{lewd_feel}。{social_line}\n"
         f"{stutter_line}"
-        f"【关于聊天对象】\n"
-        f"你在跟{user_id}聊天。{aff_line}"
-        f"{dup_line}"
-        f"{time_line}"
+        f"{hint_line}"
+        f"{obj_line}"
         f"{restriction}"
-        "【行为参考】行为规则见上文SKILL.md中情绪/时段/好感度部分\n"
+        "【规则】按人设说话。\n"
         "\n"
         f"{ctx_line}"
     )
+    # 固定标记包裹，方便下游解析（配置项 inject_wrapper 可关）
+    if config and config.get("inject_wrapper", True):
+        return "〖persona_state〗\n" + body.rstrip("\n") + "\n〖/persona_state〗\n"
+    return body
 
 
 def update_state(state: dict, llm_response: str, user_msg: str, config: dict = None):
@@ -669,6 +1197,72 @@ def update_state(state: dict, llm_response: str, user_msg: str, config: dict = N
             state["depravity"] = 0
 
 
+# ── 能力边界：启动期探测同类插件，避免互相覆盖 ──
+# 本机看不到 AstrBot 框架源码（它跑在容器里），所以只做目录扫描，
+# 读 metadata.yaml 的 name/desc 做关键词匹配。只在启动时跑一次，不在请求路径上。
+MEMORY_KEYWORDS = ("memory", "mem0", "longterm", "long-term", "long_term", "recall", "记忆")
+PERSONA_KEYWORDS = ("persona", "personality", "人格", "人设", "character")
+
+
+def _iter_plugin_meta(base: Path):
+    """极简 yaml 读取：只取 name 和 desc 两行，不引入 yaml 依赖。"""
+    for meta in base.glob("*/metadata.yaml"):
+        try:
+            text = meta.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        name = desc = ""
+        for line in text.splitlines():
+            ls = line.strip()
+            if ls.startswith("name:"):
+                name = ls[5:].strip().strip("\"'")
+            elif ls.startswith("desc:"):
+                desc = ls[5:].strip().strip("\"'")
+        yield meta.parent.name, name, desc
+
+
+def detect_conflicting_plugins(self_marker: str = "cinwcc") -> dict:
+    """扫描 data/plugins，返回 {"memory": [插件目录名], "persona": [...]}。"""
+    found = {"memory": [], "persona": []}
+    base = Path("data/plugins")
+    if not base.exists():
+        return found
+    for dirname, name, desc in _iter_plugin_meta(base):
+        blob = f"{dirname} {name} {desc}".lower()
+        if self_marker and self_marker in blob:
+            continue
+        if any(k in blob for k in MEMORY_KEYWORDS):
+            found["memory"].append(dirname)
+        if any(k in blob for k in PERSONA_KEYWORDS):
+            found["persona"].append(dirname)
+    return found
+
+
+# ── LLM 工具：把"不是每轮都必须"的细节改成按需拉取 ──
+try:
+    from astrbot.core.agent.tool import FunctionTool
+    from pydantic.dataclasses import dataclass as _pyd_dataclass
+    from typing import Any as _Any
+    _HAS_TOOL = True
+except Exception:      # 框架版本不一致时不拖垮插件加载
+    FunctionTool = None
+    _HAS_TOOL = False
+
+
+if _HAS_TOOL:
+    @_pyd_dataclass
+    class _LiliStateTool(FunctionTool):
+        """插件自带的工具，避免依赖框架的一次性 handler 绑定。"""
+
+        plugin: _Any = None
+        method_name: str = ""
+
+        async def call(self, context, **kwargs):
+            event = getattr(getattr(context, "context", None), "event", None)
+            method = getattr(self.plugin, self.method_name)
+            return await method(event, **kwargs)
+
+
 # ── 插件主体 ──
 
 @register("astrbot_plugin_lili_state", "mcxxiu", "角色状态管理插件", "1.5.2")
@@ -680,6 +1274,46 @@ class LiliStatePlugin(Star):
         self._patch_config_defaults()
         self._ensure_skills()
         self._log_cache = {}  # umo -> conversation_log list（save_conversation_log=False 时用）
+
+        # 存储后端：sqlite（默认）或 json，可随时切回
+        global _BACKEND
+        backend = str(self.config.get("storage_backend", "sqlite") or "sqlite").strip().lower()
+        _BACKEND = "sqlite" if backend == "sqlite" else "json"
+        if _BACKEND == "sqlite":
+            try:
+                init_db(self.config)
+                moved = migrate_json_to_db(self.config)
+                if moved:
+                    logger.info(f"启动迁移: {moved} 个会话已导入 SQLite")
+            except Exception as e:
+                _BACKEND = "json"
+                logger.warning(f"SQLite 初始化失败，回退 JSON 存储: {e}")
+        logger.info(f"状态存储后端: {_BACKEND}")
+
+        # 启动预热：一次性把持久化状态读进内存，之后请求路径只读内存
+        loaded = prewarm_states(self.config)
+        logger.info(f"状态缓存预热完成: {loaded} 个会话已载入内存")
+
+        self._register_state_tools()
+
+        # 能力边界检测：同类插件存在时优雅降级，不互相覆盖
+        self._memory_delegate = ""
+        try:
+            found = detect_conflicting_plugins("cinwcc")
+            forced = str(self.config.get("delegate_target", "") or "").strip()
+            if forced:
+                self._memory_delegate = forced
+            elif self.config.get("auto_delegate_memory", True) and found["memory"]:
+                self._memory_delegate = found["memory"][0]
+            if found["persona"]:
+                logger.warning("检测到其他人格类插件: " + ", ".join(found["persona"])
+                               + "；同时注入可能打架，建议只保留一个")
+            if self._memory_delegate:
+                logger.info(f"记忆能力已委托给 {self._memory_delegate}，本插件记忆工具降级")
+            else:
+                logger.info("未检测到记忆类插件，记忆能力由本插件独立提供")
+        except Exception as e:
+            logger.warning(f"能力边界检测失败，按独立运行处理: {e}")
 
         bot_name = _get_bot_name(self.config)
         skill = _load_skill_content()
@@ -854,7 +1488,7 @@ class LiliStatePlugin(Star):
             umo = event.unified_msg_origin
             uid = event.message_obj.sender.user_id
             msg = event.message_str or ""
-            state = load_state(umo, self.config)
+            state = get_state(umo, self.config)  # 只读内存，不碰磁盘
 
             # save_conversation_log=False 时从内存缓存恢复日志
             if not self.config.get("save_conversation_log", True) and umo in self._log_cache:
@@ -883,6 +1517,13 @@ class LiliStatePlugin(Star):
             timeout_secs = self.config.get("history_timeout_seconds", 600)
             groom_history(state, max_count, timeout_secs)
 
+            # 离线推演：纯内存计算，未到阈值直接返回（<10us）
+            em_before = state.get("emotion")
+            sn_before = state.get("social_need")
+            state, decay_hint = apply_time_decay(state, config=self.config)
+            if state.get("emotion") != em_before or state.get("social_need") != sn_before:
+                mark_dirty(_cache_key(umo), source="decay")   # 数值变了才安排异步落盘
+
             ctx_entries = self.config.get("conversation_context_entries", 20)
             msg_max_chars = self.config.get("user_msg_max_chars", 200)
             thought_mode = self.config.get("bot_thought_mode", "内心想法")
@@ -890,26 +1531,28 @@ class LiliStatePlugin(Star):
                                        config=self.config,
                                        context_entries=ctx_entries,
                                        msg_max_chars=msg_max_chars,
-                                       thought_mode=thought_mode)
+                                       thought_mode=thought_mode,
+                                       decay_hint=decay_hint)
+            logger.debug(f"[inject] key={_cache_key(umo)} len={len(inject)} "
+                         f"hint={bool(decay_hint)}")
 
             # 记录该用户最后被看到的时间戳（随状态文件持久化，与 save_conversation_log 无关；
             # minutes_since_last 在日志里找不到该用户上一条时用它回退）
-            state.setdefault("last_seen", {})[uid] = time.time()
+            now_ts = time.time()
+            state.setdefault("last_seen", {})[uid] = now_ts
+            # 推演基线：每次对话都刷新，保证下一轮的离线时长从这次算起
+            state["last_interaction_time"] = now_ts
 
             # 注入到当前用户消息（req.prompt），而非历史上下文（req.contexts）
             # 原因: Runner 构建消息时:
             #   messages = bind_checkpoint_messages(request.contexts)  ← 历史消息
             #   messages.append(assemble_context(request))            ← 当前消息来自 req.prompt
             # 所以 inject 挂到 req.prompt 头部，才会出现在当前消息最前面
-            _injected = False
             if req.prompt:
                 req.prompt = f"{inject}\n\n{req.prompt}"
-                _injected = True
-            elif req.system_prompt:
-                req.system_prompt += f"\n\n{inject}\n"
-                _injected = True
             else:
-                req.system_prompt = inject
+                # 红线：绝不动 system_prompt（会作废前缀缓存）。prompt 为空时放弃本轮注入
+                logger.debug("req.prompt 为空，跳过状态注入以保护前缀缓存")
 
             event.set_extra("_lili_state", state)
             event.set_extra("_lili_user_msg", msg)
@@ -972,6 +1615,179 @@ class LiliStatePlugin(Star):
             bot_name = _get_bot_name(self.config)
             logger.warning(f"{bot_name}状态更新失败: {e}")
 
+    def _register_state_tools(self):
+        """注册按需拉取工具。失败不影响主流程。"""
+        if not _HAS_TOOL:
+            logger.warning("当前 AstrBot 版本不支持 FunctionTool，状态工具未注册")
+            return
+        try:
+            tools = []
+            if self.config.get("enable_relationship_tool", True):
+                tools.append(_LiliStateTool(
+                    name="get_relationship_detail",
+                    description=(
+                        "查询当前聊天对象与本角色的关系细节：好感/心情/堕落等数值档位、"
+                        "对方今天重复发了几次同样的话、距对方上次发言多久。"
+                        "仅当回复需要判断关系深浅、决定要不要更亲近或更冷淡、"
+                        "或者要吐槽对方重复刷屏时调用；日常寒暄不要调用。"
+                    ),
+                    parameters={"type": "object", "properties": {}, "required": []},
+                    handler=None, plugin=self,
+                    method_name="_tool_relationship_detail"))
+            if self.config.get("enable_memory_tool", True):
+                tools.append(_LiliStateTool(
+                    name="get_memory_summary",
+                    description=(
+                        "读取本会话最近若干条对话原文，用于回忆之前聊过什么。"
+                        "仅当对方提到过去发生的事、或需要接上前面的话题时调用；"
+                        "普通聊天、情绪表达、寒暄都不要调用。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "返回条数，默认 6，最多 12。",
+                                "default": 6,
+                            }
+                        },
+                        "required": [],
+                    },
+                    handler=None, plugin=self,
+                    method_name="_tool_memory_summary"))
+            if not tools:
+                logger.info("状态工具全部关闭（配置项 enable_*_tool）")
+                return
+            self.context.add_llm_tools(*tools)
+            logger.info("状态工具已注册: " + ", ".join(t.name for t in tools))
+        except Exception as e:
+            logger.warning(f"状态工具注册失败（不影响主流程）: {e}")
+
+    async def _tool_relationship_detail(self, event, **kwargs):
+        """只读内存，不查库不做 IO。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        uid = ""
+        try:
+            uid = str(event.get_sender_id())
+        except Exception:
+            uid = str(getattr(event, "sender_id", "") or "")
+        st = get_state(umo, self.config)
+        logger.debug(f"[tool] get_relationship_detail umo={umo} uid={uid}")
+
+        aff = int(st.get("affection", 0) or 0)
+        em = int(st.get("emotion", 60) or 0)
+        parts = [f"聊天对象 {uid or '未知'}",
+                 f"好感度 {aff}（{_affection_feel(aff)}）",
+                 f"心情 {em}"]
+        if self.config.get("enable_lewdness", True):
+            lew = int(st.get("lewdness", 0) or 0)
+            dep = int(st.get("depravity", 0) or 0)
+            parts.append(f"色情倾向 {lew}（{_lewdness_feel(lew)}）")
+            if dep:
+                parts.append(f"堕落 {dep}（{_depravity_feel(dep)}）")
+        repeat = st.get("repeat") or {}
+        if repeat.get("date") == datetime.now().strftime("%Y-%m-%d"):
+            msgs = ((repeat.get("users") or {}).get(str(uid)) or {})
+            top = max(msgs.items(), key=lambda kv: kv[1]) if msgs else None
+            if top and top[1] > 1:
+                parts.append(f"对方今天把同一句话重复了 {top[1]} 次")
+        mins = minutes_since_last(st, uid)
+        if mins:
+            parts.append("距对方上一条消息: " + ("刚刚" if mins == "刚刚" else str(mins)))
+        return "；".join(parts)[:400]
+
+    async def _tool_memory_summary(self, event, limit: int = 6, **kwargs):
+        """只读内存里的对话日志，按需返回最近若干条。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if getattr(self, "_memory_delegate", ""):
+            return (f"记忆由 {self._memory_delegate} 插件负责，本插件不提供记忆摘要。"
+                    f"需要回忆过去时请以对方当前话题为准。")
+        st = get_state(umo, self.config)
+        try:
+            n = max(1, min(int(limit), 12))
+        except (TypeError, ValueError):
+            n = 6
+        log = st.get("conversation_log") or []
+        logger.debug(f"[tool] get_memory_summary umo={umo} n={n} have={len(log)}")
+        if not log:
+            return "本会话还没有可回忆的对话记录。"
+        lines = []
+        for item in log[-n:]:
+            if not isinstance(item, dict):
+                continue
+            role = "对方" if item.get("role") == "user" else "我"
+            content = str(item.get("content", "")).replace("\n", " ").strip()[:80]
+            lines.append(f"{role}: {content}")
+        return "最近对话（旧到新）:\n" + "\n".join(lines)
+
+    async def _recent_events(self, key: str, limit: int = 5) -> list:
+        """最近事件：sqlite 后端查表，json 后端没有流水，返回空。命令路径，不在热路径上。"""
+        if _BACKEND != "sqlite" or _DB_FILE is None:
+            return []
+
+        def _q():
+            conn = _db_connect(_DB_FILE)
+            try:
+                return conn.execute(
+                    "SELECT ts, source, dimension, delta FROM state_events"
+                    " WHERE umo = ? ORDER BY ts DESC, id DESC LIMIT ?",
+                    (key, int(limit))).fetchall()
+            finally:
+                conn.close()
+
+        try:
+            return await asyncio.to_thread(_q)
+        except Exception as e:
+            logger.warning(f"读取事件失败: {e}")
+            return []
+
+    async def _build_state_report(self, umo: str, limit: int = 5) -> str:
+        key = _cache_key(umo)
+        st = get_state(umo, self.config)
+        tag = umo.rsplit("!", 1)[-1] if "!" in umo else umo.rsplit(":", 1)[-1]
+        tag = tag[:8]
+        lines = [f"状态 · {tag}"]
+        lines.append(
+            f"心情 {int(st.get('emotion', 0) or 0)}，社交 {int(st.get('social_need', 0) or 0)}，"
+            f"好感 {int(st.get('affection', 0) or 0)}，色情 {int(st.get('lewdness', 0) or 0)}，"
+            f"堕落 {int(st.get('depravity', 0) or 0)}")
+        lit = st.get("last_interaction_time") or 0
+        if lit:
+            lines.append("上次交互 " + time.strftime("%m-%d %H:%M", time.localtime(lit)))
+        lines.append(f"存储后端 {_BACKEND}")
+        evs = await self._recent_events(key, limit)
+        if evs:
+            lines.append(f"最近 {len(evs)} 条事件（新到旧）")
+            for ts, source, dim, delta in evs:
+                d = int(delta or 0)
+                lines.append(f"{time.strftime('%m-%d %H:%M', time.localtime(ts))} "
+                             f"{source} {dim} {'+' if d > 0 else ''}{d}")
+        else:
+            lines.append("暂无事件记录")
+        return "\n".join(lines)[:600]
+
+    @filter.command("persona_state")
+    async def cmd_persona_state(self, event: AstrMessageEvent):
+        """查看当前会话的状态快照和最近事件。/persona_state 10 可指定条数。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        limit = 5
+        raw = (getattr(event, "message_str", "") or "").strip()
+        for token in raw.split()[1:]:
+            if token.isdigit():
+                limit = max(1, min(int(token), 20))
+                break
+        text = await self._build_state_report(umo, limit)
+        logger.debug(f"[cmd] persona_state umo={umo} limit={limit}")
+        if hasattr(event, "plain_result"):
+            yield event.plain_result(text)
+            return
+        await event.send(text)
+
     async def terminate(self):
         bot_name = _get_bot_name(self.config)
+        # 退出前把还没落盘的状态同步写掉
+        flush_all_sync()
+        global _FLUSH_WORKER
+        if _FLUSH_WORKER is not None and not _FLUSH_WORKER.done():
+            _FLUSH_WORKER.cancel()
         logger.info(f"{bot_name}状态管理插件已卸载")

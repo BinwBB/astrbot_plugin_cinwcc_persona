@@ -11,6 +11,33 @@
 
 ---
 
+## 注入格式约定
+
+每轮状态注入统一用固定标记包裹，方便下游插件或脚本解析：
+
+〖persona_state〗
+【状态】…心情、色情倾向、社交需求
+【对象】…当前聊天对象与好感档位
+【规则】按人设说话。
+〖/persona_state〗
+
+- 位置固定在 `req.prompt` 头部，**永远不修改 system_prompt**（保住 KV 前缀缓存）
+- 标记本身约占 10 token，配置项 `inject_wrapper` 可以关掉
+- 解析示例：`re.search(r"〖persona_state〗(.*?)〖/persona_state〗", text, re.S)`
+
+## 命令
+
+- `/persona_state` — 查看当前会话的状态快照和最近 5 条事件
+- `/persona_state 10` — 指定事件条数（1~20）
+
+## 存储
+
+- 默认 `sqlite`：`data/plugin_data/lili_state.db`，快照表 + 事件流水表，支持 `/persona_state` 查历史
+- 配置项 `storage_backend` 可切回 `json`；首次用 sqlite 时会自动把旧 `state.json` 迁入并改名成 `.json.bak`，同时在 `lili_state_backup_时间戳` 留一份目录备份
+- 读写都在内存完成，落盘走后台协程 + 1.5 秒防抖，不占请求路径
+
+---
+
 ## 前置条件
 
 1. AstrBot 已启用 **lili_persona** Skill（首次加载插件时会自动从插件目录复制）
